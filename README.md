@@ -28,8 +28,12 @@ It is up to the caller to do something with the file/directory operated on.
 See [action.yml](action.yml) for the set of inputs. The file should be
 self-documenting.
 
-The only output is `output_path`, which holds the filesystem path of the
-signed/notarized/stapled entity.
+The outputs are:
+
+- `output_path`: filesystem path of the signed/notarized/stapled entity (or the
+  first path when multiple `input_path` values are provided).
+- `output_paths`: newline-separated list of output paths when multiple
+  `input_path` values are provided.
 
 ## Examples
 
@@ -146,4 +150,22 @@ steps:
       # The `AuthKey_XXXXXX.12` file created above must have the same `api_key` value listed here.
       app_store_connect_api_issuer: 'abcdef-42-2411312...'
       app_store_connect_api_key: 'DEADBEEF'
+```
+
+Notarize multiple signed assets in parallel.
+
+```yaml
+steps:
+  # Add steps here to materialize signed assets (.app/.zip/.dmg/etc).
+
+  - name: Notarize (parallel)
+    uses: BloopAI/apple-code-sign-action@v1
+    with:
+      input_path: |
+        MyApp.zip
+        MyOtherApp.zip
+      sign: false
+      notarize: true
+      notarize_concurrency: 2
+      app_store_connect_api_key_json_file: app_store_key.json
 ```

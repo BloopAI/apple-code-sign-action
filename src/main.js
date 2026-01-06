@@ -3,6 +3,49 @@ const exec = require('@actions/exec')
 const toolCache = require('@actions/tool-cache')
 const os = require('os')
 
+async function mapWithConcurrency(items, concurrency, fn) {
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error('concurrency must be a positive integer')
+  }
+
+  const results = new Array(items.length)
+  let nextIndex = 0
+
+  async function worker() {
+    for (let index = nextIndex++; index < items.length; index = nextIndex++) {
+      results[index] = await fn(items[index], index)
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () => worker()
+  )
+  await Promise.all(workers)
+
+  return results
+}
+
+async function execRcodesign(rcodesign, args) {
+  let stdout = ''
+  let stderr = ''
+
+  const exitCode = await exec.exec(rcodesign, args, {
+    silent: true,
+    ignoreReturnCode: true,
+    listeners: {
+      stdout: data => {
+        stdout += data.toString()
+      },
+      stderr: data => {
+        stderr += data.toString()
+      }
+    }
+  })
+
+  return { exitCode, stdout, stderr }
+}
+
 async function getRcodesign(version) {
   const platform = os.platform()
   const arch = os.arch()
@@ -68,10 +111,29 @@ async function getRcodesign(version) {
 
 async function run() {
   try {
-    const inputPath = core.getInput('input_path', { required: true })
+    const inputPathRaw = core.getInput('input_path', { required: true })
+    let inputPaths = core.getMultilineInput('input_path')
+    if (inputPaths.length === 1 && inputPaths[0].includes('\n')) {
+      inputPaths = inputPaths[0]
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean)
+    }
+    if (inputPaths.length === 0) {
+      throw new Error('input_path is required')
+    }
+
+    const hasMultipleInputPaths = inputPaths.length > 1
+    const inputPath = inputPaths[0] || inputPathRaw.trim()
     const outputPath = core.getInput('output_path')
     const sign = core.getBooleanInput('sign')
     const notarize = core.getBooleanInput('notarize')
+    const notarizeConcurrencyInput = core.getInput('notarize_concurrency')
+    const notarizeConcurrency = parseInt(notarizeConcurrencyInput || '0', 10)
+    if (Number.isNaN(notarizeConcurrency) || notarizeConcurrency < 0) {
+      throw new Error('notarize_concurrency must be a non-negative integer')
+    }
+
     const staple = core.getBooleanInput('staple')
     const configFiles = core.getMultilineInput('config_file')
     const profile = core.getInput('profile')
@@ -96,9 +158,22 @@ async function run() {
 
     const rcodesign = await getRcodesign(rcodesignVersion)
 
+    let signedPaths = inputPaths
     let signedPath = inputPath
 
+    if (hasMultipleInputPaths && outputPath) {
+      throw new Error(
+        'output_path cannot be used with multiple input_path values'
+      )
+    }
+
     if (sign) {
+      if (hasMultipleInputPaths) {
+        throw new Error(
+          'Multiple input_path values are not supported when sign=true'
+        )
+      }
+
       const args = ['sign']
 
       for (const path of configFiles) {
@@ -143,6 +218,7 @@ async function run() {
       }
 
       await exec.exec(rcodesign, args)
+      signedPaths = [signedPath]
     }
 
     let stapled = false
@@ -176,9 +252,64 @@ async function run() {
         args.push('--wait')
       }
 
-      args.push(signedPath)
+      const concurrency =
+        notarizeConcurrency > 0 ? notarizeConcurrency : signedPaths.length
 
-      await exec.exec(rcodesign, args)
+      core.info(`Submitting ${signedPaths.length} file(s) for notarization`)
+
+      const results = await mapWithConcurrency(
+        signedPaths,
+        concurrency,
+        async path => {
+          core.info(`Starting notarization: ${path}`)
+
+          const { exitCode, stdout, stderr } = await execRcodesign(rcodesign, [
+            ...args,
+            path
+          ])
+
+          if (exitCode === 0) {
+            return { path, ok: true, stdout, stderr }
+          }
+
+          return { path, ok: false, exitCode, stdout, stderr }
+        }
+      )
+
+      const failures = results.filter(r => !r.ok)
+      for (const result of results) {
+        core.startGroup(
+          result.ok
+            ? `notary-submit: ${result.path}`
+            : `notary-submit failed: ${result.path}`
+        )
+
+        if (!result.ok) {
+          core.error(`exit code: ${result.exitCode}`)
+        }
+
+        if (result.stdout.trim()) {
+          if (result.ok) {
+            core.info(result.stdout.trim())
+          } else {
+            core.error(result.stdout.trim())
+          }
+        }
+        if (result.stderr.trim()) {
+          if (result.ok) {
+            core.info(result.stderr.trim())
+          } else {
+            core.error(result.stderr.trim())
+          }
+        }
+        core.endGroup()
+      }
+
+      if (failures.length > 0) {
+        throw new Error(
+          `Notarization failed for: ${failures.map(f => f.path).join(', ')}`
+        )
+      }
 
       if (staple) {
         stapled = true
@@ -192,12 +323,64 @@ async function run() {
         args.push('--config-file', path)
       }
 
-      args.push(signedPath)
+      const concurrency =
+        notarizeConcurrency > 0 ? notarizeConcurrency : signedPaths.length
 
-      await exec.exec(rcodesign, args)
+      const results = await mapWithConcurrency(
+        signedPaths,
+        concurrency,
+        async path => {
+          core.info(`Stapling notarization ticket: ${path}`)
+
+          const { exitCode, stdout, stderr } = await execRcodesign(rcodesign, [
+            ...args,
+            path
+          ])
+
+          if (exitCode === 0) {
+            return { path, ok: true, stdout, stderr }
+          }
+
+          return { path, ok: false, exitCode, stdout, stderr }
+        }
+      )
+
+      const failures = results.filter(r => !r.ok)
+      for (const result of results) {
+        core.startGroup(
+          result.ok ? `staple: ${result.path}` : `staple failed: ${result.path}`
+        )
+
+        if (!result.ok) {
+          core.error(`exit code: ${result.exitCode}`)
+        }
+
+        if (result.stdout.trim()) {
+          if (result.ok) {
+            core.info(result.stdout.trim())
+          } else {
+            core.error(result.stdout.trim())
+          }
+        }
+        if (result.stderr.trim()) {
+          if (result.ok) {
+            core.info(result.stderr.trim())
+          } else {
+            core.error(result.stderr.trim())
+          }
+        }
+        core.endGroup()
+      }
+
+      if (failures.length > 0) {
+        throw new Error(
+          `Stapling failed for: ${failures.map(f => f.path).join(', ')}`
+        )
+      }
     }
 
-    core.setOutput('output_path', signedPath)
+    core.setOutput('output_path', signedPaths[0])
+    core.setOutput('output_paths', signedPaths.join('\n'))
   } catch (error) {
     core.setFailed(error.message)
   }

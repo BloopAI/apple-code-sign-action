@@ -26,6 +26,10 @@ inputs:
     description: 'Whether to notarize'
     default: 'false'
 
+  notarize_concurrency:
+    description: 'Max parallel notarization submissions when input_path is multi-line (0 = unlimited)'
+    default: '0'
+
   # Attaches a pre-issued "notarization ticket" to an entity.
   staple:
     description: 'Whether to staple a notarization ticket'
@@ -113,7 +117,9 @@ inputs:
 
 outputs:
   output_path:
-    description: 'Path to signed/notarized/stapled entity'
+    description: 'Path to signed/notarized/stapled entity (first when multiple input_path values)'
+  output_paths:
+    description: 'Newline-separated list of output paths when multiple input_path values are provided'
 
 runs:
   using: node20
